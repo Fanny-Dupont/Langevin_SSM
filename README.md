@@ -28,4 +28,4 @@ See the package repository for installation instructions and documentation.
 
 ## Contact
 
-For questions, please contact [Fanny Dupont](fanny.dupont@stat.ubc.ca) .
+For questions, please contact [Fanny Dupont](mailto:fanny.dupont@stat.ubc.ca).
