@@ -14,7 +14,7 @@ Nigel E. Hussey, Marie Auger-Méthé
 
 - `simulation_study/` — Code to reproduce the simulation study
 - `Code_Case_Study/` — Code to reproduce the case study
-- `Additional_simulation_penalty/` — Additional simulation results
+- `Additional_simulation_penalty/` — Code to reproduce additional simulation study (i.e., spatial penalty)
 
 ---
 
