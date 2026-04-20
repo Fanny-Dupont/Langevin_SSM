@@ -5,7 +5,7 @@ case study presented in:
 
 **Inferring resource selection and utilization distributions from irregular 
 and error-prone animal tracking data**  
-Fanny Dupont, Brett McClintock, Jan-Ole Fischer, Marianne Marcoux, 
+Fanny Dupont, Brett T. McClintock, Jan-Ole Fischer, Marianne Marcoux, 
 Nigel E. Hussey, Marie Auger-Méthé
 
 ---
