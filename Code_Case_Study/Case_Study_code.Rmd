@@ -1,0 +1,1477 @@
+---
+title: "Code for reproducing the narwhal case study"
+subtitle: "Inferring resource selection and utilization distributions from irregular and error-prone animal tracking data using the habitat-driven Langevin diffusion"
+author: "Fanny Dupont, Brett T. McClintock, Jan-Ole Fischer, Nigel E. Hussey, Marianne Marcoux, Marie Auger-Méthé"
+output: html_document
+date: ""
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(raster)
+library(rasterVis)
+library(viridis)
+library(ggplot2)
+library(future)
+library(furrr)
+library(doRNG)
+library(RStoolbox)
+library(Rcpp)
+library(aniMotum)  
+library(geoR)
+library(Rhabit)
+library(momentuHMM)
+library(TMB)
+library(geosphere)
+library(terra)
+library(RColorBrewer)
+library(sf)
+library(ggforce)
+library(dplyr)
+library(readr)
+library(lubridate)
+library(tidyr)
+library(raster)
+library(MASS)
+library(knitr)
+library(langevinSSM)
+```
+
+
+This document presents annotated code and explanations for the case study, together with the steps used to obtain the results. The two-step method relies on the `fitLangevin()` function from the `langevinSSM` package, whereas the SSM–Langevin approach is implemented using custom code built with TMB and C++. All required code and documents are included in the folder.
+
+
+Set the seed to get the same results
+```{r set seed}
+set.seed(1,kind="Mersenne-Twister",normal.kind = "Inversion")
+```
+
+# 1. Prepare the data
+Load the environmental covariates. They must have the same dimensions: the same number of cells and the same raster size. The bathymetry raster comes from the International Bathymetric Chart of the Arctic Ocean (https://www.gebco.net/data-products-gridded-bathymetry-data/gebco2024-grid)
+
+The mask raster takes the value 1 for land and 0 otherwise.
+
+The covariates that will be used as covariate in the analysis
+
+- Bathymetry (`bathy_scaled`) from the International Bathymetric Chart of the Arctic Ocean (https://www.gebco.net/data-products-gridded-bathymetry-data/gebco2024-grid)
+- Landmask (`landmask_scaled`): derived from the binary mask covariate (1 = land, 0 = water). It represents the distance to the nearest water cell, with values close to $0$ on water and increasing with distance from water. This covariate is used to impose the land constraint.
+
+
+All covariate rasters are scaled such that their gradients range between 0 and 0.1, improving model stability and performance in TMB. Similarly, all location coordinates are converted to km by dividing by 1e3. I use a penalty to enforce data on water (works well in the work with Brett)
+
+```{r}
+setwd("/Users/fannydupont/Desktop/PhD/LangevinSSM_Package/Code_Case_Study")
+```
+
+```{r load covariate data,include=FALSE}
+bathy <- raster("bathy_17.tif")
+mask <- raster("land_mask_17.tif") # built from land raster but adapted resolution and grid cells number to bathy
+
+
+land <- st_read("NorthernBaffin_UTM/NorthernBaffin_UTM.shp")
+land <- st_transform(land, crs = crs(bathy))
+st_geometry(land) <- st_geometry(land) / 1e3
+st_crs(land) <-  crs(bathy)
+
+```
+
+
+
+Scale all rasters from meters to kilometers. This improves numerical stability in TMB, which is not very stable with very large covariate values.
+
+```{r, include = FALSE}
+ext <- extent(bathy)
+  
+# Divide all coordinates by 1e3: scaling helps with TMB stability
+ext_scaled <- extent(ext@xmin/1e3, ext@xmax/1e3,
+                     ext@ymin/1e3, ext@ymax/1e3)
+
+extent(bathy)  <- ext_scaled
+extent(mask) <- ext_scaled
+
+```
+
+```{r build the constraint covariate}
+
+landmask2 = mask # 1 if on land, NA otherwise. Is used for the constraint
+landmask2[landmask2==1] = NA
+dist_to_w = raster::distance(landmask2)
+
+landmask = dist_to_w
+```
+
+
+```{r, fig.width=10, fig.height=10, out.width="800px"}
+bathy <- min(bathy, 0)
+
+# convert raster to data frame
+df_bathy <- as.data.frame(bathy, xy = TRUE, na.rm = FALSE)
+names(df_bathy)[3] <- "depth"
+
+pdf("plots/bathy.pdf", width = 35, height = 40)
+ggplot(df_bathy, aes(x = x, y = y, fill = depth)) +
+  geom_raster() +
+  scale_fill_gradientn(
+    colours  = colorRampPalette(c("#08306b", "#2171b5", "#6baed6", "#c6dbef", "white"))(100),
+    na.value = "white"
+  ) +
+  coord_equal(xlim = c(480, 620)) +
+  guides(fill = guide_colorbar(
+    barwidth        = unit(2,  "cm"),
+    barheight       = unit(20, "cm"),
+    ticks.linewidth = 3,
+    ticks.colour    = "black",
+    frame.colour    = "black",
+    frame.linewidth = 1.5
+  )) +
+  labs(title = "", x = "", y = "", fill = "Depth") +
+  theme_bw() +
+  theme(panel.grid       = element_blank(),
+        plot.title       = element_text(hjust = 1, size = 45),
+        legend.text      = element_text(size = 55),
+        legend.title      = element_text(size = 55, margin = margin(b = 20)),
+        axis.text        = element_text(size = 55),
+        axis.title       = element_text(size = 55),
+        axis.ticks       = element_line(linewidth = 1.5),
+        axis.ticks.length = unit(0.4, "cm"))
+dev.off()
+```
+
+
+```{r rescale gradients, include = FALSE}
+
+# Define `scale_raster()`, a function that calculates the gradient of a raster using ctmcmove::rast.grad(), computes the L2 norm of the  gradient at each cell of the raster, and rescales these values to a specified range (new_min to new_max). Scaling the gradient in this way helps improve the numerical stability of the algorithm.
+
+
+scale_raster <- function(r, new_min = 0, new_max = 0.1) {
+  grad <- ctmcmove::rast.grad(r)
+  grad_x <- grad$rast.grad.x
+  grad_y <- grad$rast.grad.y
+  grad_norm <- sqrt(grad_x^2 + grad_y^2)
+  
+  # min and max of gradient norm
+  g_min <- min(values(grad_norm), na.rm = TRUE)
+  g_max <- max(values(grad_norm), na.rm = TRUE)
+  
+  scaled <- ((r - g_min) / (g_max - g_min)) * (new_max - new_min) + new_min # make new_max>new_min>0
+  return(scaled)
+}
+```
+
+```{r scale rasters, include = FALSE}
+bathy_scaled         <- scale_raster(bathy)
+landmask_scaled      <- scale_raster(landmask)
+landmask2_scaled      <- scale_raster(landmask^2)
+```
+
+
+Plot the scaled covariates, whose gradient L2 norms have been rescaled between $0$ and $0.1$ to improve numerical stability in the model.
+
+```{r plot}
+par(mfrow = c(2, 2))  # 2 rows, 2 columns
+
+par(
+  xpd = FALSE,
+  cex = 1,
+  cex.axis = 1,
+  cex.lab  = 1,
+  lwd = 2,
+  mar = c(4, 4, 2, 2),  # slightly tighter margins for 4 plots
+  xaxs = "i",
+  yaxs = "i"
+)
+
+# Compute gradients once
+grad_land <- ctmcmove::rast.grad(landmask_scaled)
+grad_bathy <- ctmcmove::rast.grad(bathy_scaled)
+
+# ---- Landmask: gradient x direction
+plot(grad_land$rast.grad.x,
+     col = viridis::viridis(100),
+     main = "", xlab = "", ylab = "",
+     legend = TRUE, axes = FALSE)
+axis(1, tck = -0.01)
+axis(2, tck = -0.01)
+box()
+title(main = "Landmask: gradient x")
+
+# ---- Landmask: gradient y direction
+plot(grad_land$rast.grad.y,
+     col = viridis::viridis(100),
+     main = "", xlab = "", ylab = "",
+     legend = TRUE, axes = FALSE)
+axis(1, tck = -0.01)
+axis(2, tck = -0.01)
+box()
+title(main = "Landmask: gradient y")
+
+# ---- Bathymetry: gradient x direction ----
+plot(grad_bathy$rast.grad.x,
+     col = viridis::viridis(100),
+     main = "", xlab = "", ylab = "",
+     legend = TRUE, axes = FALSE)
+axis(1, tck = -0.01)
+axis(2, tck = -0.01)
+box()
+title(main = "Bathymetry: gradient x")
+
+# ---- Bathymetry: gradient y direction ----
+plot(grad_bathy$rast.grad.y,
+     col = viridis::viridis(100),
+     main = "", xlab = "", ylab = "",
+     legend = TRUE, axes = FALSE)
+axis(1, tck = -0.01)
+axis(2, tck = -0.01)
+box()
+title(main = "Bathymetry: gradient y")
+```
+
+
+
+Next, we load the narwhal data and have a look at it.
+```{r load data, include = FALSE}
+data_ALL = read_csv("Narwhal_Case_Study.csv")
+
+```
+
+
+The dataset was preprocessed before analysis. Tracks with gaps longer than two hours were split, and only segments containing more than fifteen locations were retained. Locations with class "Z" were removed, and ARGOS points with extremely large positional uncertainty (`smaj` $\geq$ 1e5) or with missing error estimates were excluded.  
+
+The resulting dataset includes the following columns:
+
+- **ID** – animal identifier; for split tracks, the part after a dash indicates the segment.  
+- **type** – either `"Argos"` or `"FastGPS"`.  
+- **datetime_UTC** – date and time of the observation in Coordinated Universal Time (UTC).  
+- **loc_class** – ARGOS location class, or `"G"` for FastLoc GPS  
+- **smaj, smin, eor** – parameters of the ARGOS measurement error ellipse. For fastloc GPS, these were set to $50$ meters as recommended by Wildlife Computers (https://wildlifecomputers.com/data/technologies/fastloc/?utm_source=chatgpt.com). `"smin"` and `"smaj"` are in kilometers.
+- **X, Y** – Narwhal locations in the bathymetry coordinate reference system, already divided by 1e3 
+- **lon, lat** - Narwhal locations in lon/lat format 
+- **velocity** – animal velocity in kilometers per hour, calculated as the straight-line distance between consecutive locations divided by the time elapsed. The distance was computed using the great-circle distance between successive points, and the time difference was calculated in hours. Velocity was then obtained by dividing the distance by the time interval.
+- **dt** time difference, in hours, between consecutive locations
+
+
+```{r}
+
+# Convert data_ALL to sf (already done)
+data_ALL.sf <- st_as_sf(data_ALL, coords = c("X", "Y"), remove = FALSE, crs = crs(bathy))
+
+nbAnimals = length(unique(data_ALL.sf$ID))
+
+# Convert bathy raster to data.frame for ggplot
+bathy_df <- as.data.frame(bathy, xy = TRUE)
+colnames(bathy_df) <- c("x", "y", "depth")
+
+# Plot bathymetry + points
+ggplot() +
+  geom_raster(data = bathy_df, aes(x = x, y = y, fill = depth)) +
+  geom_point(data = data_ALL.sf, aes(x = X, y = Y),
+             color = "#D55E00", size =0.7, alpha = 0.7) +  # customize points as needed
+  scale_fill_gradientn(colors = colorRampPalette(c("#08306b", "#2171b5", "#6baed6", "#c6dbef", "white"))(100),
+                       name = "Depth (m)") +
+  coord_equal() +
+  theme_minimal() +
+  theme(
+    axis.title = element_blank(),
+    axis.text = element_text(size = 12),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10)
+  )+
+  ggtitle("Raw data overlaid on bathymetry")
+```
+
+This code can be executed to extract additional information about the locations of points relative to land, water, and other environmental covariates.
+
+#### (a) Example: plotting points with their associated measurement error ellipse
+```{r, include=FALSE}
+
+
+onLand <- as.logical(rowSums(st_intersects(data_ALL.sf, land, sparse = FALSE)))
+
+
+both_idx <- which(data_ALL.sf$X <= 600 &data_ALL.sf$X >= 570 & onLand)  # only select a couple of points
+
+
+bathy_df <- as.data.frame(bathy, xy = TRUE)
+colnames(bathy_df) <- c("x", "y", "depth")
+
+ggplot() +
+  geom_raster(data = bathy_df, aes(x = x, y = y, fill = depth)) +
+  scale_fill_gradientn(colors = viridis::mako(100), 
+                       name = "Depth (m)") +
+  geom_point(data = data_ALL, aes(x = X, y = Y), color = "#D55E00",alpha=0.1) +
+  geom_ellipse(data = data_ALL[both_idx, ], 
+               aes(x0 = X, y0 = Y, a = smaj, b = smin, angle = eor * pi / 180),
+               color = "red", fill = NA) +
+    coord_equal() +
+  theme_minimal() +
+  theme(
+    axis.title = element_blank(),
+    axis.text = element_text(size = 12),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10)
+  )
+```
+
+
+#### (b) Example: Save points whose associated ellipses have a 97.5% confidence area that does not extend over water
+```{r save points where ellipse does not cover water (for later use),eval = FALSE, include = FALSE}
+
+# Compute the proportion of each location's measurement error ellipse that falls on land
+# This follows the observation equation described in McClintock et al. (2015)
+
+# Initialize vector to store proportion on land
+on_land_prop <- array()
+
+# Extract ellipse parameters from the data
+x0 <- data_ALL$X            # observed X coordinates
+y0 <- data_ALL$Y            # observed Y coordinates
+M  <- data_ALL$smaj         # semi-major axis of error ellipse
+m  <- data_ALL$smin         # semi-minor axis of error ellipse
+c  <- data_ALL$eor          # orientation (rotation) of error ellipse in radians
+
+# Mean positions for multivariate normal sampling
+mu <- cbind(x0, y0)
+
+# Precompute constants for ellipse transformation
+z <- sqrt(2.0)
+s2c <- sin(c)^2
+c2c <- cos(c)^2
+M2 <- (M / z)^2
+m2 <- (m / z)^2
+
+# Loop over all observations
+for(i in 1:nrow(data_ALL)){ 
+  # Construct the 2x2 covariance matrix for the ellipse
+  cov_obs <- matrix(0, nrow = 2, ncol = 2)
+  cov_obs[1,1] <- M2[i] * s2c[i] + m2[i] * c2c[i]
+  cov_obs[2,2] <- M2[i] * c2c[i] + m2[i] * s2c[i]
+  cov_obs[1,2] <- 0.5 * (M[i]^2 - m[i]^2) * cos(c[i]) * sin(c[i])
+  cov_obs[2,1] <- cov_obs[1,2]
+
+  # Sample 10,000 points from the ellipse using a multivariate normal
+  n <- 1e4
+  samples <- mvrnorm(n, mu = mu[i,], Sigma = cov_obs)
+  
+  # Extract land/water values at sampled locations
+  land_values <- extract(mask, samples)
+  
+  # Compute proportion of ellipse falling on land
+  on_land_prop[i] <- mean(land_values == 1, na.rm = TRUE)
+}
+idxx = which(on_land_prop>0.99) # Change proportion if needed
+```
+
+
+
+```{r points that ellipses are mostly on land, eval = FALSE, include = FALSE}
+cat(length(idxx)/nrow(data_ALL)*100, " % of points have ellipses that do not cover water")
+
+idxx_GPS <- idxx[data_ALL$type[idxx] == "FastGPS"]
+cat(length(idxx_GPS)/length(idxx)*100,  "% of bad points are fastGPS")
+ggplot() +
+  geom_raster(
+    data = bathy_df,
+    aes(x = x , y = y, fill = depth > 0)
+  ) +
+  scale_fill_manual(
+    values = c("FALSE" = "white", "TRUE" = "darkgreen"),
+    name = "Land/Water"
+  ) +
+  geom_point(
+    data = data_ALL[idxx_GPS,],
+    aes(x = X, y = Y),
+    color = "black"
+  ) +
+  geom_ellipse(
+    data = data_ALL[idxx_GPS,],
+    aes(x0 = X, y0 = Y, a = smaj*1e3, b = smin*1e3, angle = eor * pi / 180),
+    color = "red",
+    fill = NA
+  ) +
+  theme_minimal() +
+  coord_equal() +
+  ggtitle("Raw data with associated ellipses that does not cover water, FastLoc-GPS")
+
+
+
+ggplot() +
+  geom_raster(
+    data = bathy_df,
+    aes(x = x , y = y, fill = depth > 0)
+  ) +
+  scale_fill_manual(
+    values = c("FALSE" = "white", "TRUE" = "darkgreen"),
+    name = "Land/Water"
+  ) +
+  geom_point(
+    data = data_ALL[idxx,],
+    aes(x = X, y = Y),
+    color = "black"
+  ) +
+  geom_ellipse(
+    data = data_ALL[idxx,],
+    aes(x0 = X, y0 = Y, a = smaj, b = smin, angle = eor * pi / 180),
+    color = "red",
+    fill = NA
+  ) +
+  theme_minimal() +
+  coord_equal() +
+  ggtitle("All raw data with associated ellipses that does not cover water")
+
+```
+
+
+
+```{r}
+ani_data <- data_ALL %>%
+  dplyr::select(id = ID, date = datetime_UTC, lc = loc_class, lon,lat, smaj, smin, eor)
+```
+
+
+```{r look at dt}
+hist(data_ALL$dt,breaks=100,main=c("dt in hours in all narwhal data"))
+```
+
+
+```{r velocity look}
+hist(data_ALL$velocity_km.h,breaks=100,main=c("velocity in km per hours in all narwhal data"))
+```
+
+There are a few extremely high, unrealistic velocities in the data; we retain them to examine how the models handle such extreme values.
+
+# 2. Fit two-step method to all narwhal data
+
+## (a) Get filtered data
+We begin with the two-step method. Unlike in the simulation where the timestep of 0.01 was sufficiently small to forgo explicit time-stepping, the timestep here can be considerably larger. We therefore set time.step = 0.1 and predict at the original observation times, without interpolating timestamps. The fitted locations are then extracted and used as the data in any subsequent analysis. 
+
+```{r filter with animotum, include= FALSE}
+# Fit a state-space model (random walk) to the raw animal telemetry data
+# without interpolating timestamps. We keep the original observation times.
+fit <- fit_ssm(
+  ani_data, 
+  model = "crw",       # correlated random walk model did not work
+  spdf = FALSE,       # do not return SpatialPointsDataFrame
+  time.step  = 0.1,
+  map = list(psi = factor(NA))  # fix psi parameter (no behavioral switching)
+)
+
+# Extract the fitted locations from the SSM
+loc.rw <- grab(fit, what = "fitted")
+
+# Store the fitted locations for later use
+data_ALLfiltered <- loc.rw
+
+```
+
+
+```{r convert to proper projection}
+# Convert the fitted locations to an sf object with geographic coordinates
+data_ALLfiltered.sf <- sf::st_as_sf(
+  data_ALLfiltered <- loc.rw,    # fitted locations from the SSM
+  coords = c("lon", "lat"),      # columns for longitude and latitude
+  crs = 4326                     # WGS84 geographic coordinate system
+) %>% 
+  sf::st_transform(crs = crs(bathy))  # reproject to match the bathymetry raster CRS
+
+# Extract projected coordinates from the sf object
+coords <- sf::st_coordinates(data_ALLfiltered.sf)
+
+# Add the projected coordinates (in km) back to the data frame
+data_ALLfiltered.sf$X <- coords[, 1] / 1e3  # convert meters to km
+data_ALLfiltered.sf$Y <- coords[, 2] / 1e3  # convert meters to km
+
+# Compute time differences between consecutive observations for each animal
+data_ALLfiltered.sf <- data_ALLfiltered.sf %>%
+  arrange(id, date) %>%       # sort by animal ID and date
+  group_by(id) %>%            # group by animal
+  mutate(
+    time1 = lag(date),                     # previous observation time
+    dt = as.numeric(difftime(date, time1, units = "hours"))  # time difference in hours
+  ) %>%
+  ungroup()
+
+# Replace NA time differences (i.e., first observation per track) with 0
+data_ALLfiltered.sf$dt[which(is.na(data_ALLfiltered.sf$dt))] <- 0
+```
+
+
+```{r}
+plot(
+  bathy, 
+  col  = colorRampPalette(c("#08306b", "#2171b5", "#6baed6", "#c6dbef", "white"))(100),           
+  main = "Filtered data with aniMotum"
+)
+
+points(data_ALLfiltered.sf$X, data_ALLfiltered.sf$Y, cex = 0.2, col = "red")  # filtered data
+
+legend(
+  "topright", 
+  legend = c("Filtered"), 
+  col = c("red"), 
+  pch = 16, 
+  cex = 0.8
+)
+```
+
+## (b) Prep the covariates
+```{r get covariate ready, for two-step method}
+
+# Put environmental covariates into a list
+covList <- list(terra::rast(bathy_scaled))
+names(covList) <- "bathy"
+# Note: no landmask is included for the two-step method
+```
+
+## (c) Prep model parameters
+
+```{r}
+# Parameters of the model to fit
+model <- "underdamped"         
+
+## smooth gradient specifications (based on adjacent cells)
+## slows model fitting, but can reduce bias if \Delta_t is large (i.e. samplingRate > 1) relative to timeStep (Blackwell & Matthiopoulos 2024, https://doi.org/10.1002/ecy.4457)
+
+npoints <- 0 # number of smoothing points around current raster cell (0 = none, 4 = diagonal, 8 = queen neighborhood)
+curweight <- 1/2 # weight of the current cell in smoothing
+weights <- c(curweight, rep((1-curweight)/npoints, npoints)) # smoothing weights
+zetaScale <- 1  # scaling factor for smooth gradient neighborhood
+
+
+# Initialise data list for TMB
+dat <- data.frame(
+  x = data_ALLfiltered.sf$X, 
+  y = data_ALLfiltered.sf$Y
+)
+dat$time <- data_ALLfiltered.sf$date
+dat$id <- as.numeric(as.integer(factor(data_ALLfiltered.sf$id))) 
+# langevinSSM::fitLangevin fits the model with no measurement error when all smaj=NA, smin=NA, eor=NA, x.sd=NA, and y.sd=NA
+dat$smaj <- rep(NA,length(dat$time))
+dat$smin <- rep(NA,length(dat$time))
+dat$eor <- rep(NA,length(dat$time))
+dat$x.sd<- rep(NA,length(dat$time))
+dat$y.sd <- rep(NA,length(dat$time))
+dat$lc <- rep(NA,length(dat$time))
+
+dat <- langevinSSM::formatData(dat,
+  id = "id",
+  date = "time",
+  coord = c("x", "y"),
+  epar = c("smaj", "smin", "eor"))
+
+
+# Location values
+init.mu <- cbind(dat$x,dat$y) # filtered locations  (mu is not estimated here)
+```
+
+In particular, for the two-step approach, the data have already been corrected:
+
+- There are **no missing observations**.  
+- There is **no specification of measurement error ellipses**, because we assume the filtered locations are accurate (hence the NAs in the code)  
+
+All observed positions are treated as correct inputs to the model, and the subsequent analysis focuses on fitting the Langevin movement model and including environmental covariates.
+
+As in the simulation study, we consider two initialization strategies. The first uses neutral parameter starting values,
+where movement parameters are derived from the data but habitat-selection coefficients and
+velocity are set to zero; these can all be obtained via the `initialValues()` function from the `langevinSSM` package. The second
+strategy uses $15$ randomly drawn movement and habitat-selection parameters.
+
+The model is then fitted using `fitLangevin()`, and we use the following arguments:
+
+- `data`: a formatted dataset in `formatData` format
+- `spatial.covs`: the spatial covariates (raster layers) used to define the RSF
+
+By default, `fitLangevin()` first performs an inner optimization over the random effects (here `vel`) before optimizing over all parameters (`inner.optimizer = TRUE`), which improves numerical stability and convergence.
+
+
+## (c) Fit the Langevin model to the filtered data.
+
+```{r, echo=TRUE, results="hide", message=FALSE, warning=FALSE, output =FALSE}
+
+Nrep <- 15                                        # number of random initializations to explore
+nllkALL_filtered <- array()                       # store negative log-likelihoods for each fit
+parMat <- matrix(NA, nrow = Nrep, 3)      # store estimated parameters
+NarwhalALL_filtered <- rep <- list()              # list to store model fits and reports
+colnames(parMat) <- c(paste0("beta",1), "sigma","gamma")  # parameter names
+
+# Fit the Langevin model to the filtered narwhal data
+
+
+
+for (irep in 1:Nrep) {
+  if(irep==1){
+    # Neutral initialization 
+    parm <- langevinSSM::initialValues(dat,spatialCovs = covList) # 'parm' includes neutral starting values from langevinSSM::initialValues, v_mu
+
+  }else{
+  # Initialize movement and selection parameter values randomly
+  sigma <- abs(rnorm(1, 0, 3))   # speed parameter
+  gamma <- abs(rnorm(1, 0, 3))   # friction parameter (directional persistence)
+  beta  <- c(rnorm(1, 0, 3))     # resource selection coefficient
+  psi <- 1                       # SD scaling of observation error (not used here)
+  
+  # Initialize latent velocity (vel) for underdamped Langevin
+  init.v_mu <- matrix(0, length(dat$id),2)
+  for (i in 1:nbAnimals) {
+      aInd <- which(data_ALLfiltered.sf$id == unique(data_ALLfiltered.sf$id)[i])
+      # approximate initial velocities as finite differences, adjusted by gamma
+      init.v_mu[aInd[-1],1] <- diff(init.mu[aInd,1]) / 
+        (data_ALLfiltered.sf$dt[aInd[-1]] * exp(-gamma * data_ALLfiltered.sf$dt[aInd[-1]]))
+      init.v_mu[aInd[-1],1] <- diff(init.mu[aInd,1]) / 
+        (data_ALLfiltered.sf$dt[aInd[-1]] * exp(-gamma * data_ALLfiltered.sf$dt[aInd[-1]]))
+  }
+   # Prepare the list of parameters for TMB
+    parm <- list(
+      sigma = sigma,
+      beta = beta,
+      vel = init.v_mu,
+      gamma = gamma)
+    
+  }
+    # Fit with the fixed selection parameters initialized at their true values and velocity derived from location
+    NarwhalALL_filtered[[irep]] <- fitLangevin(dat,par=parm,spatialCovs=covList,
+                                 silent=TRUE, control=list(trace=0)) 
+  
+
+    # Store parameter estimates
+    parMat[irep, 1:3] <- NarwhalALL_filtered[[irep]]$par
+    parMat[irep, "sigma"] <- NarwhalALL_filtered[[irep]]$estimates$natural["sigma",1]
+    if (model == 1) parMat[irep, "gamma"] <- NarwhalALL_filtered[[irep]]$estimates$natural["gamma",1]
+    
+    # Record negative log-likelihood if fit converged
+    if (NarwhalALL_filtered[[irep]]$convergence != 0) {
+      nllkALL_filtered[irep] <- NA
+    } else {
+      if (sum(is.na(NarwhalALL_filtered[[irep]]$sdreport[,2])) == 0) {
+        nllkALL_filtered[irep] <- NarwhalALL_filtered[[irep]]$objective
+      } else {
+        nllkALL_filtered[irep] <- NA
+      }
+    }
+}
+
+```
+
+```{r,echo=FALSE}
+cat("Neg-loglikelihood for the ", Nrep, " replications", nllkALL_filtered)
+```
+
+```{r}
+idx <- which.min(nllkALL_filtered)                 # Find the replicate with the lowest negative log-likelihood
+
+# estUD_2step <- langevinSSM::getUD(spatialCovs = covList, fit = NarwhalALL_filtered[[idx]])
+mask_terra <- rast(mask)  
+# estUD_2step[mask_terra == 1] <- NA
+# plot(estUD_2step)
+
+# This should be the same as below
+estUD_2step <-  NarwhalALL_filtered[[idx]]$par[1]*covList$bathy
+estUD_2step[mask_terra == 1] <- NA # UD is not defined on land
+
+# plot(estUD_2step)
+```
+
+
+
+```{r}
+# Get 95% confidence intervals for selection parameters 
+lower <-  NarwhalALL_filtered[[idx]]$estimates$natural[1,1] - qnorm(0.975) *  NarwhalALL_filtered[[idx]]$estimates$natural[1,2]
+upper <-  NarwhalALL_filtered[[idx]]$estimates$natural[1,1]+ qnorm(0.975) * NarwhalALL_filtered[[idx]]$estimates$natural[1,2]
+
+ci_ALL <- data.frame(
+  Coeff = c("bathy"),
+  Estimate = NarwhalALL_filtered[[idx]]$estimates$natural[1,1],
+  StdError = NarwhalALL_filtered[[idx]]$estimates$natural[1,2],
+  CI_Lower = lower,
+  CI_Upper = upper,
+  Type = "ALL_filtered"
+)
+
+```
+
+
+```{r,message=FALSE}
+land_notscaled <- st_read("NorthernBaffin_UTM/NorthernBaffin_UTM.shp")
+```
+
+```{r}
+# Use the right raster with the right scale for functions like st_intersects()
+# Observed data
+df <- data.frame(
+  X = data_ALLfiltered.sf$X*1e3, 
+  Y = data_ALLfiltered.sf$Y*1e3  
+)
+data.sf <- st_as_sf(df, coords = c("X", "Y"), remove = FALSE, crs = crs(bathy))  
+
+onLand <- as.logical(rowSums(st_intersects(data.sf, land_notscaled, sparse = FALSE)))
+
+# Estimated locations from best-fit model
+df <- data.frame(
+  X = init.mu[,1],   # estimated X positions 
+  Y = init.mu[,2]    # estimated Y positions 
+)
+
+# Convert to sf to compare with the land raster
+res_2step_spdf_False.sf <- st_as_sf(df, coords = c("X", "Y"), remove = FALSE, crs = crs(bathy))  
+onLand.res_2step_spdf_False.sf <- as.logical(rowSums(st_intersects(res_2step_spdf_False.sf, land_notscaled, sparse = FALSE)))  # for estimated two-step locations: TRUE if a point intersects land
+```
+
+```{r table summary}
+# Number of locations that are on land (raw data)
+n_raw_land <- sum(onLand)
+
+# How many of them are on water now (after model fitting)
+n_raw_land_now_water <- sum(onLand & !onLand.res_2step_spdf_False.sf)
+
+# How many that were on water are pushed on land
+n_raw_water_now_land <- sum(!onLand & onLand.res_2step_spdf_False.sf)
+
+```
+
+
+
+
+# 3. Fit a Langevin SSM, estimate the observation error scaling ($\psi$)
+
+In this section, we fit the SSM with $\psi$ treated as a free parameter to account for potential inaccuracies in the location uncertainties, such as systematic underestimation from the Kalman filter and the circular error assumption in the measurement error. We include **two covariates**: bathymetry and a landmask^2.
+
+
+The landmask acts as a **spatial constraint**, ensuring that estimated locations falling on land are penalized and thus pushed toward water. As noted earlier, this langevin SSM is implemented using custom code, as it incorporates penalties on $\sigma$, $\psi$, and the landmask, which are not currently available in the package.
+
+## (a) Prep covariates
+```{r, message = FALSE}
+# Same as becore but with two covariates
+# Put cov in a list
+covList <- list(bathy_scaled,landmask2_scaled)
+names(covList) <- c("bathy","landmask2")
+# Stack them into a multi-layer SpatRaster
+raster_stack <- stack(covList)
+
+
+raster_data <- list(
+  raster_vals = array(as.numeric(values(raster_stack)), 
+                      dim = c(nlayers(raster_stack),
+                              nrow(raster_stack),
+                              ncol(raster_stack))),
+  raster_coords = coordinates(raster_stack),
+  raster_resolution = res(raster_stack),
+  raster_extent = c(xmin(raster_stack), xmax(raster_stack),
+                    ymin(raster_stack), ymax(raster_stack)),
+  n_covs = nlayers(raster_stack)
+)
+```
+
+
+We add a **mask covariate**, which corresponds to $p_1$ in equation (16) of the paper. 
+
+
+```{r, message = FALSE}
+maskList <- list(landmask_scaled)
+names(mask) <- c("landmask")
+# Stack them into a multi-layer SpatRaster
+raster_stack <- stack(maskList)
+
+
+# Following the simulation.R code
+mask_data <- list(
+  mask_vals = array(as.numeric(values(raster_stack)),  
+                      dim = c(nlayers(raster_stack),
+                              nrow(raster_stack),
+                              ncol(raster_stack))),
+  mask_coords = coordinates(raster_stack),
+  mask_resolution = res(raster_stack),
+  mask_extent = c(xmin(raster_stack), xmax(raster_stack),
+                      ymin(raster_stack), ymax(raster_stack))
+)
+
+
+```
+
+## (b) Prep data and model parameters
+```{r, message = FALSE}
+data <- data_ALL
+
+# same as before but put them again for the sake of ...
+model <- 1 # underdamped Langevin model (1 = underdamped, 0 = overdamped)
+tracepar <- FALSE    # if TRUE, trace parameters during optimization iterations
+
+
+## smooth gradient specifications (based on adjacent cells)
+## slows model fitting, but can reduce bias if \Delta_t is large (i.e. samplingRate > 1) relative to timeStep (Blackwell & Matthiopoulos 2024, https://doi.org/10.1002/ecy.4457)
+
+npoints <- 0 # number of smoothing points around current raster cell (0 = none, 4 = diagonal, 8 = queen neighborhood)
+curweight <- 1/2 # weight of the current cell in smoothing
+weights <- c(curweight, rep((1-curweight)/npoints, npoints)) # smoothing weights
+zetaScale <- 1  # scaling factor for smooth gradient neighborhood
+
+# Round timestamps to nearest second for consistency
+data$datetime_UTC_round <- floor_date(data$datetime_UTC, "second")
+data_ALLfiltered.sf$date_round <- floor_date(data_ALLfiltered.sf$date, "second")
+# Compute time differences between consecutive points for each animal
+data_ALLfiltered.sf <- data_ALLfiltered.sf %>%
+  arrange(id, date_round) %>%
+  group_by(id) %>%
+  mutate(
+    time1_round = lag(date_round),                            # previous timestamp
+    dt_round = as.numeric(difftime(date_round, time1_round, units = "hours"))  # delta time in hours
+  ) %>%
+  ungroup()
+
+# Replace NA time differences (i.e., first observation) with 0
+data_ALLfiltered.sf$dt_round[which(is.na(data_ALLfiltered.sf$dt_round))] <- 0
+
+
+# Combine filtered locations with original data for measurement error info
+data_aniMotum <- data_ALLfiltered.sf %>%
+  left_join(
+    data %>%
+      dplyr::select(ID, datetime_UTC_round, X, Y, smaj, smin, eor) %>%
+      rename(X.raw = X, Y.raw = Y),  # keep raw coordinates for SSM fitting
+    by = c("id" = "ID", "date_round" = "datetime_UTC_round")
+  )
+
+
+# Prepare data list for TMB model
+dat <- list(
+  model = model,
+  Y = as.matrix(rbind(data_aniMotum$X.raw, data_aniMotum$Y.raw)), # observed locations
+  dt = data_aniMotum$dt_round                                 # time differences
+)
+dat$isd <- rep(1, length(data_aniMotum$id))                   # indicate all points are observed
+dat$obs_mod <- rep(NA, ncol(dat$Y))                           # placeholder for observation model
+dat$obs_mod[dat$isd == 1] <- 1                                # mark observed points
+dat$ID <- as.numeric(as.integer(factor(data_aniMotum$id)))    # numeric animal IDs
+dat$nbStates <- 1                                             # only one hidden state for HMM Langevin (as with two-step method)
+dat$nbObs <- rep(1, ncol(dat$Y))                              # number of observations per time step
+dat$smaj <- data_aniMotum$smaj                                   # semi-major axis of measurement error ellipse
+dat$smin <- data_aniMotum$smin                                   # semi-minor axis
+dat$eor <- data_aniMotum$eor                                    # orientation of ellipse
+dat$K <- matrix(NA, ncol(dat$Y), 2)                           # placeholder for future use
+dat$scale_factor <- 1
+dat <- c(dat, raster_data, mask_data)                         # include covariates and mask
+dat$smoothGradient <- ifelse(npoints > 0, 1, 0)               # indicate if smoothing is applied
+dat$weights <- weights
+dat$zetaScale <- zetaScale
+
+# Initial latent locations: start at the observed (raw) locations 
+init.mu <- as.matrix(rbind(data_aniMotum$X.raw, data_aniMotum$Y.raw))
+```
+
+As in the previous model, there are no missing observations because we predict at the times of the recorded locations. However, unlike before, this model accounts for measurement error through the estimated error ellipses and estimates $\psi$ parameter, which scales the semi-minor axis of the ARGOS / GPS error ellipse.
+
+Since the `langevinSSM` package does not yet support penalties, the Langevin SSM is implemented directly in TMB using
+the `fitLangevin_maskpen_neg.cpp` file, which encodes the three penalties $p_1$, $p_2$,
+and $p_3$ and constrains the coefficient associated with the landmask squared covariate to be negative. Specifically, `fitLangevin_maskpen_neg` adds a negative coefficient associated with the last covariate provided (here, `landmask2`). This covariate is not intended for resource selection, but rather to implement a spatial constraint that discourages predicted locations from being on land within the Langevin model.
+
+The same initialization strategies are used: one with neutral
+starting values and 15 randomly drawn parameter sets. This code also serves as a useful reference for those wishing to understand how the Langevin model is implemented in TMB/C++ and to make manual modifications.
+
+## (c) Fit Langevin SSM with land-mask penalty
+```{r, echo=TRUE, results="hide", message=FALSE, warning=FALSE}
+# Fit Langevin SSM with land-mask penalty
+
+# Compile/load TMB model
+compile("src/fitLangevin_maskpen_neg.cpp")
+dyn.load(dynlib("src/fitLangevin_maskpen_neg"))
+
+# Setup for multiple initializations
+Nrep <- 15                    # number of random initial values to explore
+nllk <- array()               # store negative log-likelihoods
+parMat <- matrix(NA, nrow=100, 5) # store estimated parameters
+NarwhalALL <- rep <- list()   # store fitted objects and reports
+colnames(parMat) <- c( paste0("beta",1:2), "sigma","gamma", "psi") # one more beta than two-step, associated with land_mask
+
+
+# Loop over initializations
+for (irep in 1:Nrep){
+  if(irep ==1){
+    beta = c(0,-1e4) # bc the second coefficient is on log scale 
+    dat_notformat <- data.frame(
+                      model = model,
+                      x = data_aniMotum$X.raw, 
+                      y = data_aniMotum$Y.raw,        
+                      date = data_aniMotum$date,
+                      smaj = dat$smaj,
+                      smin = dat$smin,
+                      eor = dat$eor
+                      )
+    dat_notformat$id <-  dat$ID
+  
+    dat_format <- langevinSSM::formatData(dat_notformat,
+    id = "id",
+    date = "date",
+    coord = c("x", "y"),
+    epar = c("smaj", "smin", "eor"))
+    parm_langevinSSM <- initialValues(dat_format,spatialCovs=covList)
+    parm <- list(
+      log_sigma = log(parm_langevinSSM$sigma),
+      beta = matrix(beta,1,length(beta)),
+      mu = init.mu,           # initial locations
+      vel =   init.v_mu <- matrix(0, 2, ncol(dat$Y)),
+      log_gamma = log(parm_langevinSSM$gamma),
+      l_delta = 0,
+      l_gamma = matrix(0,1,2),
+      l_psi = log(psi),
+      l_tau = c(0,0),
+      l_rho_o = 0
+    )
+                        
+  }else{
+  sigma <- abs(rnorm(1,0,3))       # movement scale
+  gamma <- abs(rnorm(1,0,3))       # friction/velocity persistence
+  beta <- c(rnorm(2,0,3))          # resource selection coefficients
+  psi <- 1                         # measurement error SD scaling
+ 
+  init.mu <- as.matrix(rbind(data_aniMotum$X.raw, data_aniMotum$Y.raw))
+  # Compute initial velocities for each animal
+  init.v_mu <- matrix(0, 2, ncol(dat$Y))
+  for(i in 1:nbAnimals){
+    aInd <- which(data_aniMotum$id == unique(data_aniMotum$id)[i])
+    init.v_mu[1,aInd[-1]] <- diff(init.mu[1,aInd]) / 
+      (data_aniMotum$dt[aInd[-1]] * exp(-gamma * data_aniMotum$dt[aInd[-1]]))
+    init.v_mu[2,aInd[-1]] <- diff(init.mu[2,aInd]) / 
+      (data_aniMotum$dt[aInd[-1]] * exp(-gamma * data_aniMotum$dt[aInd[-1]]))
+  }
+  
+    
+    # Parameter list for TMB
+    parm <- list(
+      log_sigma = log(sigma),
+      beta = matrix(beta,1,length(beta)),
+      mu = init.mu,           # initial locations
+      vel = init.v_mu,       # initial velocities
+      log_gamma = log(gamma),
+      l_delta = 0,
+      l_gamma = matrix(0,1,2),
+      l_psi = log(psi),
+      l_tau = c(0,0),
+      l_rho_o = 0
+    )
+  }
+   
+    re <- c("mu", "vel")        # treat locations and velocities as random effects
+    map_inner <- lapply(parm[names(parm)[!names(parm) %in% c("mu","vel")]], function(x) factor(rep(NA,length(x))))
+
+    obj1 <- TMB::MakeADFun(
+        dat,
+        parm,
+        map = map_inner,
+        random = re,
+        DLL = "fitLangevin_maskpen_neg",
+        hessian = TRUE,
+        silent = TRUE,
+        inner.control = list(maxit = 10000, trace=0)
+      )
+
+   # obj1$fn()
+
+    smoothed_pars <- obj1$env$parList()
+
+    parm$mu <- smoothed_pars$mu
+    parm$vel <- smoothed_pars$vel
+  
+   map <- list(
+    l_delta  = factor(NA),
+    l_gamma  = factor(c(NA, NA)),
+    l_rho_o  = factor(NA),
+    l_tau    = factor(c(NA, NA))
+    )
+  # Create AD function for TMB
+  # message("   Fitting model...")
+  obj2 <- MakeADFun(
+    dat,
+    parm,
+    map = map,
+    random = re,
+    DLL = "fitLangevin_maskpen_neg",
+    hessian = TRUE,
+    silent = TRUE,
+    inner.control = list(maxit = 10000, trace=0)
+  )
+  
+  obj2$env$tracepar <- tracepar
+  
+  # Optimize
+  NarwhalALL[[irep+1]] <- tryCatch(
+    {
+      do.call("nlminb",
+              args = list(
+                start = obj2$par,
+                objective = obj2$fn,
+                gradient = obj2$gr,
+                control = list(trace = 10, iter.max = 10000, eval.max = 10000)
+              )
+      )
+    },
+    error = function(e){
+      # message("Error in iteration ", irep, ": ", e$message)
+      return(NA)
+    },
+    warning = function(w){
+      # message("Warning in iteration ", irep, ": ", w$message)
+      return(NA)
+    }
+  )
+  
+  # Calculate SEs and store results if optimization converged
+
+  if(sum(is.na(NarwhalALL[[irep+1]])) == 0){
+    # message("   Calculating SEs...")
+    rep[[irep+1]] <- obj2$report()
+    sdrep <- sdreport(obj2)
+    NarwhalALL[[irep+1]]$sdreport <- summary(sdrep,"report")
+    
+    # Store estimated parameters
+    parMat[irep+1, 2:5] <- NarwhalALL[[irep+1]]$par[c(2,1,3,4)]
+    parMat[irep+1, 1] <- -1e4
+    parMat[irep+1, "sigma"] <- rep[[irep+1]]$sigma
+    if(model == 1) parMat[irep+1, "gamma"] <- rep[[irep+1]]$gamma
+    if(model == 1) parMat[irep+1, "psi"] <- rep[[irep+1]]$psi
+    
+    # Store negative log-likelihood
+    if(NarwhalALL[[irep+1]]$convergence != 0){
+      nllk[irep+1] <- NA
+    } else {
+      if(sum(is.na(NarwhalALL[[irep+1]]$sdreport[,2]))==0){
+        nllk[irep+1] <- NarwhalALL[[irep+1]]$objective
+      } else {
+        nllk[irep+1] <- NA
+      }
+    }
+  } else {
+    nllk[irep+1] <- NA
+  }
+}
+
+# Unload TMB dynamic library
+
+dyn.unload(dynlib("src/fitLangevin_maskpen_neg"))
+```
+
+
+
+```{r,include = FALSE}
+# Save the parameter matrix and negative log-likelihoods for all fits
+parMatALL = parMat
+nllkALL = nllk
+idx = which.min(nllkALL) # Find the index of the fit with the lowest negative log-likelihood
+ALLpar_final = NarwhalALL[[idx]]$par # Extract the final parameter estimates corresponding to the best fit
+```
+
+
+```{r, include = FALSE}
+estUD <- (ALLpar_final[2]*covList$bathy) # Derive the estimated log-UD for SSM Langevin
+estUD[mask == 1] <- NA # UD is not defined on land
+estUD_final <- estUD
+plot(estUD_final)
+```
+
+Let us look at the estimated coefficients:
+```{r}
+ALLpar_final
+```
+
+```{r}
+# exp(ALLpar_final[1])
+
+cat("This corresponds to an average movement speed of", sqrt(pi/2)*exp(ALLpar_final[1]), "and a persistence time scale of", 3/exp(ALLpar_final[4])*60, "minutes.")
+```
+Note that $\beta_2$ is not transformed, in the code it is $-exp(\beta_2)$ associated with the land, and so it should be transformed as such to be interpreted.
+
+```{r plot both,fig.width=15, fig.height=7}
+
+# convert to data frames
+df1 <- as.data.frame(estUD_final, xy = TRUE, na.rm = FALSE)
+df2 <- as.data.frame(estUD_2step, xy = TRUE, na.rm = FALSE)
+names(df1)[3] <- "logUD"
+names(df2)[3] <- "logUD"
+zlim <- range(c(df1$logUD, df2$logUD), na.rm = TRUE)
+
+shared_theme <- theme_bw() +
+  theme(panel.grid         = element_blank(),
+        plot.title         = element_text(hjust = 0.5, size = 7),
+        legend.text        = element_text(size = 5, margin = margin(l = 2)),
+        legend.title       = element_text(size = 5, margin = margin(b = 2)),
+        axis.text          = element_text(size = 6),
+        axis.title         = element_text(size = 6),
+        axis.ticks         = element_line(linewidth = 0.8),
+        axis.ticks.length  = unit(0.2, "cm"))
+
+ud_guide <- guides(fill = guide_colorbar(
+  barwidth        = unit(0.25, "cm"),
+  barheight       = unit(3,    "cm"),
+  ticks.linewidth = 0.8,
+  ticks.colour    = "white",
+  frame.colour    = "black",
+  frame.linewidth = 0.5
+))
+
+p1 <- ggplot(df1, aes(x = x, y = y, fill = logUD)) +
+  geom_raster() +
+  scale_fill_viridis_c(option = "mako", limits = zlim, na.value = "white") +
+  coord_equal() +
+  ud_guide +
+  labs(title = "Langevin SSM", x = "Easting (km)", y = "Northing (km)") +
+  shared_theme
+
+p2 <- ggplot(df2, aes(x = x, y = y, fill = logUD)) +
+  geom_raster() +
+  scale_fill_viridis_c(option = "mako", limits = zlim, na.value = "white") +
+  coord_equal() +
+  ud_guide +
+  labs(title = "2-step method", x = "Easting (km)", y = "Northing (km)") +
+  shared_theme
+
+p3 <- ggplot(df_bathy, aes(x = x, y = y, fill = depth)) +
+  geom_raster() +
+  scale_fill_gradientn(
+    colours  = colorRampPalette(c("#08306b", "#2171b5", "#6baed6", "#c6dbef", "white"))(100),
+    na.value = "white"
+  ) +
+  coord_equal(xlim = c(480, 620)) +
+  guides(fill = guide_colorbar(
+    barwidth        = unit(0.25, "cm"),
+    barheight       = unit(3,    "cm"),
+    ticks.linewidth = 0.8,
+    ticks.colour    = "black",
+    frame.colour    = "black",
+    frame.linewidth = 0.5
+  )) +
+  labs(title = "Bathymetry", x = "Easting (km)", y = "Northing (km)", fill = "Depth") +
+  shared_theme
+
+p3|p2|p1
+```
+
+```{r plot save}
+
+# convert to data frames
+df1 <- as.data.frame(estUD_final, xy = TRUE, na.rm = FALSE)
+df2 <- as.data.frame(estUD_2step, xy = TRUE, na.rm = FALSE)
+names(df1)[3] <- "logUD"
+names(df2)[3] <- "logUD"
+zlim <- range(c(df1$logUD, df2$logUD), na.rm = TRUE)
+
+pdf("plots/Langevin_ALLSSM_results.pdf", width = 35, height = 40)
+par(xpd = FALSE, cex = 3, cex.axis = 3, cex.lab = 3, lwd = 2, tck = 0.02)
+ggplot(df1, aes(x = x, y = y, fill = logUD)) +
+  geom_raster() +
+  scale_fill_viridis_c(option = "mako", limits = zlim, na.value = "white") +
+  coord_equal() +
+  guides(fill = guide_colorbar(
+    barwidth        = unit(2,  "cm"),
+    barheight       = unit(20, "cm"),
+    ticks.linewidth = 3,
+    ticks.colour    = "white",
+    frame.colour    = "black",
+    frame.linewidth = 1.5
+  )) +
+  theme_bw() +
+  labs(title = "", x = "Easting (km)", y = "Northing (km)") +
+  theme(panel.grid  = element_blank(),
+        plot.title  = element_text(hjust = 0.5),
+            legend.text        = element_text(size = 65, margin = margin(l = 50)),
+        legend.title      = element_text(size = 65, margin = margin(b = 60)),
+        axis.text    = element_text(size = 80),   # tick labels on both axes
+        axis.title   = element_text(size = 80),   # x and y axis titles
+        axis.ticks   = element_line(linewidth = 1.5),  # tick mark thickness
+        axis.ticks.length = unit(0.4, "cm"))      # tick mark length
+dev.off()
+
+pdf("plots/Langevin_2step_results.pdf", width = 35, height = 40)
+par(xpd = FALSE, cex = 3, cex.axis = 3, cex.lab = 3, lwd = 2, tck = 0.02)
+ggplot(df2, aes(x = x, y = y, fill = logUD)) +
+  geom_raster() +
+  scale_fill_viridis_c(option = "mako", limits = zlim, na.value = "white") +
+  coord_equal() +
+  guides(fill = guide_colorbar(
+    barwidth        = unit(2,  "cm"),
+    barheight       = unit(20, "cm"),
+    ticks.linewidth = 3,
+    ticks.colour    = "white",
+    frame.colour    = "black",
+    frame.linewidth = 1.5
+  )) +
+  labs(title = "", x = "Easting (km)", y = "Northing (km)") +
+  theme_bw() +
+  theme(panel.grid  = element_blank(),
+        plot.title  = element_text(hjust = 0.5),
+        legend.text        = element_text(size = 65, margin = margin(l = 50)),
+        legend.title      = element_text(size = 65, margin = margin(b = 60)),
+        axis.text    = element_text(size = 80),
+        axis.title   = element_text(size = 80),
+        axis.ticks   = element_line(linewidth = 1.5),
+        axis.ticks.length = unit(0.4, "cm"))
+dev.off()
+
+
+pdf("plots/bathy_nice.pdf", width = 35, height = 40)
+par(xpd = FALSE, cex = 3, cex.axis = 3, cex.lab = 3, lwd = 2, tck = 0.02)
+ggplot(df_bathy, aes(x = x, y = y, fill = depth)) +
+  geom_raster() +
+  scale_fill_gradientn(
+    colours  = colorRampPalette(c("#08306b", "#2171b5", "#6baed6", "#c6dbef", "white"))(100),
+    na.value = "white"
+  ) +
+  coord_equal(xlim = c(480, 620)) +
+  guides(fill = guide_colorbar(
+    barwidth        = unit(2,  "cm"),
+    barheight       = unit(20, "cm"),
+    ticks.linewidth = 3,
+    ticks.colour    = "black",
+    frame.colour    = "black",
+    frame.linewidth = 1.5
+  )) +
+  labs(title = "", x = "Easting (km)", y = "Northing (km)", fill = "Depth") +
+  theme_bw() +
+  theme(panel.grid         = element_blank(),
+        plot.title         = element_text(hjust = 1, size = 45),
+         legend.text        = element_text(size = 65, margin = margin(l = 50)),
+        legend.title      = element_text(size = 65, margin = margin(b = 60)),
+        axis.text          = element_text(size = 80),
+        axis.title         = element_text(size = 80),
+        axis.ticks         = element_line(linewidth = 1.5),
+        axis.ticks.length  = unit(0.4, "cm"))
+dev.off()
+```
+
+
+
+
+```{r}
+# Get 95\% CI
+lower <- NarwhalALL[[idx]]$sdreport[,1] - qnorm(0.975) * NarwhalALL[[idx]]$sdreport[,2]
+upper <- NarwhalALL[[idx]]$sdreport[,1] + qnorm(0.975) * NarwhalALL[[idx]]$sdreport[,2]
+
+ci_neg <- data.frame(
+  Coeff = c("bathy"),
+  Estimate = NarwhalALL[[idx]]$sdreport[1,1],
+  StdError = NarwhalALL[[idx]]$sdreport[1,2],
+  CI_Lower = lower[1],
+  CI_Upper = upper[1],
+  Type = "ALL_SSM_spdf_False"
+)
+ci = rbind(ci_neg,ci_ALL)
+
+ci
+```
+
+```{r}
+
+# Extract the SSM fit corresponding to the best replicate
+rep_neg <- rep[[idx]]  
+rep_final <- rep_neg  
+
+# Create a data frame of estimated SSM locations (mu) from the fit
+df <- data.frame(
+  X = rep_final$mu[1,]*1e3,  
+  Y = rep_final$mu[2,]*1e3
+)  
+
+# Convert estimated SSM locations to sf object
+res_ssm_spdf_false.sf <- st_as_sf(df, coords = c("X", "Y"), remove = FALSE, crs = crs(bathy))  
+
+# Determine which estimated SSM locations fall on land
+onLand.res_ssm_spdf_false.sf <- as.logical(rowSums(st_intersects(res_ssm_spdf_false.sf, land_notscaled, sparse = FALSE))) 
+```
+
+```{r, include = FALSE}
+# How many of them are on water now (after model fitting)
+n_raw_land_now_water_SSM <- sum(onLand & !onLand.res_ssm_spdf_false.sf)
+idx_raw_land_now_water_SSM <- which(onLand & !onLand.res_ssm_spdf_false.sf)
+
+# How many that were on water are pushed on land
+n_raw_water_now_land_SSM <- sum(!onLand & onLand.res_ssm_spdf_false.sf)
+
+# get index
+idx_pushed_onLand <- which(!onLand & onLand.res_ssm_spdf_false.sf)
+
+# stay on land
+idx_stay_onLand <- which(onLand & onLand.res_ssm_spdf_false.sf)
+```
+
+
+```{r,fig.width=20,fig.height=10}
+
+# pdf("plots/pushed_loc_onlybathy.pdf",
+#   width = 35,
+#   height = 40)
+estUD <- (ALLpar_final[3] * covList$bathy)
+estUD[mask == 1] <- NA
+
+plot(
+  estUD,
+  col = viridis::mako(100),
+  legend = FALSE,
+  axes = FALSE,
+  box = FALSE,
+  main = "",
+  xlab = "",
+  ylab = ""
+)
+
+# raw locations
+points(
+  dat$Y[1, idx_raw_land_now_water_SSM],
+  dat$Y[2, idx_raw_land_now_water_SSM],
+  pch = 21,
+  bg = "#D55E00",
+  col = "black",  
+  cex = 5 # cex 5 for manuscript
+)
+
+points(
+  rep_final$mu[1, idx_raw_land_now_water_SSM],
+  rep_final$mu[2, idx_raw_land_now_water_SSM],
+  pch = 21,
+  bg  = "#009E73",  
+  col = "black",
+  cex = 5 # cex 5 for manuscript
+)
+title(
+  "(a) Locations remaining on land (raw in orange, estimated in green) with associated uncertainty ellipses",
+  cex.main = 3,      # font size multiplier
+  font.main = 1,     # 1 = plain, 2 = bold, 3 = italic
+  col.main = "black" # title color
+)
+# dev.off()
+```
+```{r,fig.width=20,fig.height=10}
+ud_df <- as.data.frame(estUD, xy = TRUE, na.rm = FALSE)
+names(ud_df) <- c("x", "y", "ud")
+
+
+ellipse_df <- data.frame(
+  x0    = dat$Y[1, idx_pushed_onLand],
+  y0    = dat$Y[2, idx_pushed_onLand],
+  a     = ani_data$smaj[idx_pushed_onLand],
+  b     = ani_data$smin[idx_pushed_onLand],
+  angle = ani_data$eor[idx_pushed_onLand]*pi/180  # should already be radians
+)
+
+mu_df <- data.frame(
+  x = rep_final$mu[1, idx_pushed_onLand],
+  y = rep_final$mu[2, idx_pushed_onLand]
+)
+
+# (b) Locations originally on water that were pushed onto land
+
+# pdf("plots/pushed_land_loc_onlybathy.pdf", width = 35, height = 40)
+
+p <- ggplot() +
+  geom_raster(data = ud_df, aes(x = x, y = y, fill = ud)) +
+  scale_fill_viridis_c(option = "mako", na.value = NA, guide = "none") +
+  geom_point(
+    data = ellipse_df,
+    aes(x = x0, y = y0),
+    shape = 21,
+    fill = "#D55E00",
+    colour = "black",
+    size = 10
+  ) +
+  geom_point(
+    data = mu_df,
+    aes(x = x, y = y),
+    shape = 21,
+    fill = "#009E73",
+    colour = "black",
+    size = 10,
+    stroke = 1.2
+  ) +
+  coord_equal() +
+  theme_void() +
+  labs(title = "(b) Locations originally on water (orange) pushed onto land (green)") +
+  theme(
+    plot.title = element_text(size = 30, face = "plain", colour = "black")
+  )
+ print(p)
+# dev.off()
+```
+
+```{r,fig.width=20,fig.height=10}
+# (c) Locations originally on land that were pushed onto water
+# pdf("plots/stay_on_land_loc_onlybathy.pdf", width = 35, height = 40)
+
+p <- ggplot() +
+  geom_raster(data = ud_df, aes(x = x, y = y, fill = ud)) +
+  scale_fill_viridis_c(option = "mako", na.value = NA, guide = "none") +
+  geom_point(
+    data = ellipse_df,
+    aes(x = x0, y = y0),
+    shape = 21,
+    fill = "#D55E00",
+    colour = "black",
+    size = 10
+  ) +
+    geom_ellipse(
+    data = ellipse_df,
+    aes(x0 = x0, y0 = y0, a = a, b = b, angle = angle),
+    fill = "#D55E00",
+    alpha = 0.25,
+    colour = "#B24700",
+    linewidth = 0.6
+  ) +
+  geom_point(
+    data = mu_df,
+    aes(x = x, y = y),
+    shape = 21,
+    fill = "#009E73",
+    colour = "black",
+    size = 10, # size 10 for the manuscript.
+    stroke = 1.2
+  ) +
+  coord_equal() +
+  theme_void() +
+  labs(title = "(c) Locations originally on land (orange) pushed onto water (green)") +
+  theme(
+    plot.title = element_text(size = 30, face = "plain", colour = "black")
+  )
+print(p)
+# dev.off()
+
+
+```
+
+```{r summary,echo=FALSE}
+
+long_table <- data.frame(
+  Method = c(
+    "SSM (spdf = FALSE)", 
+    "Two-step (spdf = FALSE)",
+     "SSM (spdf = FALSE)", 
+    "Two-step (spdf = FALSE)",
+         "SSM (spdf = FALSE)", 
+     "Two-step (spdf = FALSE)"
+    
+  ),
+  Metric = c(
+    "Locations pushed to water",
+    "Locations pushed to water",
+    "Locations pushed to land",
+     "Locations pushed to land",
+    "Total number of location on land",
+    "Total number of location on land"
+  ),
+  Count = c(
+    n_raw_land_now_water_SSM,
+    n_raw_land_now_water,
+    n_raw_water_now_land_SSM,
+    n_raw_water_now_land,
+    sum(onLand.res_ssm_spdf_false.sf),
+    sum(onLand.res_2step_spdf_False.sf)
+  )
+)
+
+combined_table <- bind_rows(long_table)
+wide_table <- combined_table %>%
+  pivot_wider(names_from = Metric, values_from = Count)
+
+cat("Total raw location on land", n_raw_land)
+kable(wide_table, align = "l")
+
+
+```
+
+
+```{r}
+```
+
